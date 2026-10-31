@@ -26,6 +26,7 @@
   - [Streaming API](#streaming-api)
 - [Ablation / Tuning Flags](#ablation--tuning-flags)
 - [Performance Statistics](#performance-statistics)
+- [Experiments](#experiments)
 - [Project Structure](#project-structure)
 - [License](#license)
 
@@ -40,7 +41,7 @@ PETree is designed for that world. Every query is compiled to a uniform **Patter
 | Feature | Description |
 |---|---|
 | **Uncertain events** | Each event is a `[lower, upper]` time-interval with either a uniform PMF or a custom per-timestamp probability array. |
-| **Rich patterns** | Compose `SEQ`, `AND`, and `NSEQ` (negated-between) operators with arbitrarily deep nesting. |
+| **Rich patterns** | Compose `SEQ`, `AND`, and `NSEQ` (negated-between) operators; `SEQ` and `AND` nest arbitrarily, while `NSEQ` takes exactly three leaf types. |
 | **Exact confidence** | Every match carries a probability computed under possible-world semantics (Kahn topological sort + window-aware enumeration with dynamic lower-bound tightening). |
 | **Streaming** | Feed events one by one via `ingest()`; the engine auto-triggers matching when a reference event's time-window closes. |
 | **Three-tiered pruning** | (i) static Δ-min / Δ-max bound filtering on every buffer, (ii) dynamic VLB/VUB tightening per partial match, (iii) early window-violation cut during confidence enumeration. |
@@ -78,7 +79,7 @@ Patterns are built from three operators and plain-type leaves. They can be const
 | **NSEQ**     | `NSEQ(first, neg, third)`     | `first ≺ third`, and **no** `neg` event exists strictly between them. All three must be leaf types. |
 | **Leaf**     | `"A"`, `"Login"`, …           | Any bare identifier is a leaf event-type.                                                           |
 
-Nesting is arbitrary, e.g.:
+`SEQ` and `AND` nest arbitrarily. `NSEQ` is leaf-only: it may appear as a child of `SEQ`/`AND`, but its three operands must be bare event types, so it cannot contain sub-patterns and cannot be nested inside another `NSEQ`. E.g.:
 
 ```
 SEQ(AND(SEQ(A, B), C), NSEQ(D, X, E))
@@ -174,13 +175,15 @@ A `PartialMatch` whose `vlb(e) > vub(e)` for any event fails `isValid()` and is 
 Given a completed candidate, we want:
 
 ```
-Σ  [window ok] · [∀OrderPair(a,b): t_a < t_b] · [all timestamps distinct]
-t₁,…,tₙ
-      · Π  P(e_i occurs at t_i) · Π  (1 − Σ  P(neg_event occurs at t))
-         i                        neg      t in (t_first .. t_third)
+conf = Σ_{t₁,…,tₙ}  [ window ok ] · [ ∀OrderPair(a,b): t_a < t_b ] · [ all tᵢ pairwise distinct ]
+                    · Π_i P(eᵢ occurs at tᵢ)
+                    · Π_{nc} Π_{neg ∈ nc.negEvents} ( 1 − Σ_{t_first < t < t_third} P(neg occurs at t) )
 ```
 
-The engine enumerates this exactly with three accelerations:
+- `window ok` means `max(t₁,…,tₙ) − min(t₁,…,tₙ) < tw`.
+- The negation factor is one product per `NegConstraint`, each over the negation events relevant to that interval.
+
+The engine enumerates this exactly with four accelerations:
 
 1. **Topological ordering** via Kahn's algorithm on the partial-order graph — events are assigned in an order guaranteed to respect `before ≺ after` constraints so they are never re-checked.
 2. **Dynamic lower-bound tightening per assignment** — before enumerating the lower bound of event `e`, the code walks every `OrderPair(before, e)` whose `before` is already assigned and sets `lower = max(lower, assigned[before] + 1)`.
@@ -305,7 +308,7 @@ java -cp out Demo
 PETreeNode pattern = Utils.parsePattern("SEQ(A, AND(B, C), NSEQ(D, X, E))");
 ```
 
-Grammar (whitespace-insensitive, commas separate siblings, arbitrary nesting):
+Grammar (whitespace-insensitive, commas separate siblings; `SEQ`/`AND` nest arbitrarily, `NSEQ` operands must be leaves):
 
 ```
 pattern  →  SEQ ( list )
@@ -372,9 +375,9 @@ engine.setFlags(
 | Mode | What it measures |
 |---|---|
 | All on | Production performance. |
-| `sb = false` | Baseline cost of static bounds (shows how much Δ-filtering cuts buffer sizes). |
-| `dp = false` | Baseline cost of bound-tightening (shows how many partial matches would otherwise be invalid). |
-| `def = false` | Switches to eager per-event matching with a signature-based de-dup + global `totalMatches` counter. |
+| `enableStaticBounds = false` | Baseline cost of static bounds (shows how much Δ-filtering cuts buffer sizes). |
+| `enableDynamicPruning = false` | Baseline cost of bound-tightening (shows how many partial matches would otherwise be invalid). |
+| `enableDeferred = false` | Switches to eager per-event matching with a signature-based de-dup + global `totalMatches` counter. |
 
 ---
 
@@ -395,6 +398,126 @@ engine.setFlags(
 | `curMemoryBytes` | Most recent memory sample. |
 
 These are intentionally plain fields — wrap them in a report method of your choice for experiments.
+
+---
+
+## Experiments
+
+### Ablation
+
+```java
+PETreeNode p = Utils.parsePattern("AND(SEQ(A, NSEQ(B, C, D)), E)");
+// stream: pre-built List<Event>
+
+PETreeEngine full = new PETreeEngine(p, 10);          // PETree-Full
+for (Event e : stream) full.ingest(e);
+full.flush();
+
+PETreeEngine noDefer = new PETreeEngine(p, 10);
+noDefer.setFlags(false, true, true);                  // PETree-NoDefer
+for (Event e : stream) noDefer.ingest(e);
+noDefer.flush();
+
+PETreeEngine noStatic = new PETreeEngine(p, 10);
+noStatic.setFlags(true, false, true);                 // PETree-NoStatic
+for (Event e : stream) noStatic.ingest(e);
+noStatic.flush();
+
+PETreeEngine noDyn = new PETreeEngine(p, 10);
+noDyn.setFlags(true, true, false);                    // PETree-NoDyn
+for (Event e : stream) noDyn.ingest(e);
+noDyn.flush();
+```
+
+### Pattern length
+
+```java
+String[] types = {"A","B","C","D","E","F"};
+for (int len = 3; len <= 6; len++) {
+    PETreeNode p = Utils.parsePattern(
+        "SEQ(" + String.join(",", Arrays.copyOf(types, len)) + ")");
+    PETreeEngine engine = new PETreeEngine(p, 10);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+```
+
+### Time window size
+
+```java
+PETreeNode p = Utils.parsePattern("SEQ(A,B,C,D)");          // tw = 5, 10, 15, 20, 25
+for (int tw = 5; tw <= 25; tw += 5) {
+    PETreeEngine engine = new PETreeEngine(p, tw);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+```
+
+### Query shape (operator combination)
+
+```java
+String[] shapes = {
+    "SEQ(SEQ(A,B,C), SEQ(D,E,F))",    // SEQ+SEQ
+    "SEQ(AND(A,B,C), AND(D,E,F))",    // SEQ+AND
+    "SEQ(NSEQ(A,B,C), NSEQ(D,E,F))",  // SEQ+NSEQ
+    "AND(SEQ(A,B,C), SEQ(D,E,F))"     // AND+SEQ
+};
+for (String s : shapes) {
+    PETreeEngine engine = new PETreeEngine(Utils.parsePattern(s), 10);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+```
+
+### Nesting depth
+
+```java
+String[] pureSeq = {
+    "SEQ(A,B,C,D,E)",                          // depth 1
+    "SEQ(SEQ(A,B),C,D,E)",                     // depth 2
+    "SEQ(SEQ(A,SEQ(B,C)),D,E)",                // depth 3
+    "SEQ(SEQ(A,SEQ(B,SEQ(C,D))),E)"            // depth 4
+};
+String[] mixed = {
+    "SEQ(A,B,C,D,E)",                          // depth 1 (baseline)
+    "SEQ(AND(A,B),C,D,E)",                     // depth 2
+    "SEQ(AND(A,SEQ(B,C)),D,E)",                // depth 3
+    "SEQ(AND(A,SEQ(B,AND(C,D))),E)"            // depth 4
+};
+for (String s : pureSeq) {
+    PETreeEngine engine = new PETreeEngine(Utils.parsePattern(s), 10);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+for (String s : mixed) {
+    PETreeEngine engine = new PETreeEngine(Utils.parsePattern(s), 10);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+```
+
+### Real-world queries
+
+```java
+String[][] queries = {
+    { "SEQ(Mild, Moderate, Severe)",                         // Traffic Q1
+      "SEQ(Mild, Moderate, Severe, Extreme)",                // Traffic Q2
+      "NSEQ(Mild, Moderate, Extreme)",                       // Traffic Q3
+      "SEQ(Mild, AND(Severe, Extreme))" },                   // Traffic Q4
+    { "SEQ(HeartRateHigh, AND(OxygenLow, BPDrop))",          // ICU Q5
+      "SEQ(AND(HeartRateHigh, OxygenLow), BPDrop)",          // ICU Q6
+      "AND(HeartRateHigh, NSEQ(OxygenLow, BPRise, BPDrop))" },// ICU Q7
+    { "NSEQ(Walking, Standing, Sitting)",                    // Activity Q8
+      "SEQ(AND(Walking, Standing), Sitting)",                // Activity Q9
+      "AND(Walking, NSEQ(Standing, Sitting, Lying))" }       // Activity Q10
+};
+
+for (String q : queries[0]) {                  // repeat with queries[1], queries[2]
+    PETreeEngine engine = new PETreeEngine(Utils.parsePattern(q), tw);
+    for (Event e : stream) engine.ingest(e);
+    engine.flush();
+}
+```
 
 ---
 
